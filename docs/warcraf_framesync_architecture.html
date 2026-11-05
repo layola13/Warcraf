@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>魔兽争霸 III 1.27a 完整引擎架构还原（S0–S12）</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'default' });</script>
+<style>
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; max-width: 1020px; margin: 0 auto; padding: 24px; line-height: 1.7; color: #1a1a1a; }
+  h1 { font-size: 26px; border-bottom: 3px solid #1a5fb4; padding-bottom: 8px; }
+  h2 { font-size: 20px; margin-top: 36px; color: #1a5fb4; }
+  h3 { font-size: 16px; margin-top: 24px; }
+  .mermaid { background: #f8f9fa; border: 1px solid #e0e0e0; border-radius: 8px; padding: 16px; margin: 16px 0; overflow-x: auto; }
+  code { background: #f0f0f0; padding: 1px 5px; border-radius: 4px; font-size: 0.92em; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14px; }
+  th, td { border: 1px solid #ccc; padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: #eef4fc; }
+  .ev { background: #fff8e1; border-left: 4px solid #f0a500; padding: 10px 14px; margin: 14px 0; }
+  .note { background: #eef4fc; border-left: 4px solid #1a5fb4; padding: 10px 14px; margin: 14px 0; }
+  .warn { background: #fdecea; border-left: 4px solid #c0392b; padding: 10px 14px; margin: 14px 0; }
+  .addr { font-family: ui-monospace, monospace; }
+  footer { margin-top: 40px; font-size: 13px; color: #666; border-top: 1px solid #ddd; padding-top: 12px; }
+</style>
+</head>
+<body>
+
+<h1>魔兽争霸 III 1.27a 完整引擎架构还原（S0–S12）</h1>
+<p>目标：<strong>仅研究引擎内核，分析它是如何工作的</strong>。证据来源：<code>Game.dll</code>（13.2 MB，32 位 PE，1.27.0.52240）经 Ghidra 12.2 完整分析（97,839 个函数，含 RTTI 恢复），关键函数已反编译。所有地址均为该 DLL 的加载基址 <code>0x6f000000</code> 下的虚拟地址。本页原为 S0 帧同步总图，2026-11-06 由 S12 汇总轮扩展为完整架构总图；S0 章节原样保留在下方（§3–§5）。完整文字版见 <code>warcraf_architecture_complete.md</code>。</p>
+
+<h2>0. 完整架构总图</h2>
+<div class="mermaid">
+flowchart TB
+  GM["GameMain 0x6f0297d0<br/>唯一导出，155 字节薄壳"]
+  GM --> INIT["启动序列 FUN_6f027fb0<br/>Storm/MPQ 挂载 · UI 初始化 FUN_6f0280e0<br/>Gx 初始化 FUN_6f027e20 · JASS 注册"]
+  INIT --> LOOP["引擎循环 FUN_6f05f710<br/>while(true)，EvtSched + 消息泵"]
+  LOOP --> STEP["帧步进 FUN_6f30ff00<br/>25 ms 固定步长"]
+  STEP --> PUMP["事件泵 FUN_6f30ade0"]
+  PUMP --> DISP["大分发器 FUN_6f3098d0<br/>事件 0x01–0x31"]
+  PUMP --> BND["扩展分发器 FUN_6f307b50<br/>Battle.net 事件 ≥0x40"]
+  STEP --> APPLY["回合应用 FUN_6f30bac0<br/>命令 0x10–0x31"]
+  DISP --> SYNC["TurnsSync FUN_6f310c80<br/>回合包出入"]
+  APPLY --> SIM["模拟核心 CUnit/CAbility/CBuff<br/>伤害 FUN_6f6af530 · AoE FUN_6f6b19e0"]
+  SIM --> JASS["JASS2 解释器 FUN_6f7f9070<br/>注册表 6f1e9a50 / 6f6f5d00"]
+  SIM --> RNG["查表 RNG FUN_6f199400<br/>周期 8,965,109"]
+  SYNC --> CHK["七子系统校验和<br/>不一致 → TrustedDesync"]
+  SIM --> RENDER["Gx 渲染 CGxDevice<br/>D3D9 / OpenGL 双后端"]
+  SIM --> UI["UI CFrame 树<br/>FrameDef 模板"]
+  SIM --> AUDIO["音频 Miles 6.1d<br/>CSoundWar3"]
+  INIT --> MPQ["Storm MPQ 文件层<br/>补丁链 + 签名验证"]
+  DISP --> REPLAY["录像 TempReplay.w3g"]
+  BND --> BN["Battle.net<br/>CONNSTATE 13 态 · 大厅 · 天梯"]
+</div>
+
+<h2>0.1 子系统关系（谁依赖谁）</h2>
+<table>
+<tr><th>关系</th><th>证据</th></tr>
+<tr><td>引擎循环 → 帧步进 → 事件泵 / 回合应用</td><td><code>FUN_6f05f710</code> →（最后一跳未验证）→ <code>FUN_6f30ff00</code> → <code>FUN_6f310f20</code> → <code>FUN_6f30ade0</code> + <code>FUN_6f30bac0</code></td></tr>
+<tr><td>回合应用 → 模拟核心</td><td><code>FUN_6f30bac0</code> 分发 <code>FUN_6f2fxxxx</code> 解包薄壳 → 入队；消费函数未找到</td></tr>
+<tr><td>模拟 → JASS2 → 随机数</td><td>native 注册表 <code>6f1e9a50</code>/<code>6f6f5d00</code>；GetRandomInt/Real 绑定到 <code>FUN_6f199400</code> 族</td></tr>
+<tr><td>网络 → 录像 / Battle.net</td><td>GameStart 写 TempReplay.w3g；类型 ≥0x40 走扩展分发器 <code>FUN_6f307b50</code></td></tr>
+<tr><td>文件层 → 全部</td><td>MPQ 挂载链是启动前提；地图脚本、FrameDef、声音、升级文件均经 Storm 序号读出</td></tr>
+<tr><td>渲染 / UI / 音频只读模拟状态</td><td>三者不产生模拟输入；快慢不影响锁步（解耦机制本身未验证）</td></tr>
+</table>
+
+<h2>0.2 主函数地址总表（跨阶段核对无冲突）</h2>
+<table>
+<tr><th>地址</th><th>角色</th><th>阶段</th></tr>
+<tr><td class="addr">6f0297d0</td><td>GameMain，唯一导出，155 字节薄壳</td><td>S2</td></tr>
+<tr><td class="addr">6f027fb0</td><td>启动序列（292 字节）</td><td>S2、S5</td></tr>
+<tr><td class="addr">6f0280e0</td><td>UI/引擎初始化总入口（948 字节）</td><td>S2、S6、S7、S8</td></tr>
+<tr><td class="addr">6f05f710</td><td>引擎循环（564 字节，while(true)）</td><td>S2</td></tr>
+<tr><td class="addr">6f1532b0</td><td>Win32 消息泵（462 字节）</td><td>S2</td></tr>
+<tr><td class="addr">6f312740</td><td>游戏状态机 SetGameState（0–6 迁移表）</td><td>S2、S10</td></tr>
+<tr><td class="addr">6f30ff00</td><td>帧步进（1148 字节，25 ms 固定步长）</td><td>S1、S2</td></tr>
+<tr><td class="addr">6f30ade0</td><td>网络事件泵（954 字节）</td><td>S0、S1、S2、S10</td></tr>
+<tr><td class="addr">6f3098d0</td><td>网络事件大分发器（5074 字节，0x01–0x31）</td><td>S0、S1、S2、S9、S10</td></tr>
+<tr><td class="addr">6f307b50</td><td>Battle.net 事件分发器（2625 字节，0x41–0x80）</td><td>S1、S10</td></tr>
+<tr><td class="addr">6f310c80</td><td>TurnsSync 出入（435 字节）</td><td>S0、S1、S11</td></tr>
+<tr><td class="addr">6f30b1a0</td><td>事件 0x20 回合包解析（654 字节）</td><td>S0、S1</td></tr>
+<tr><td class="addr">6f30bac0</td><td>回合应用（命令 0x10–0x31）</td><td>S2、S3</td></tr>
+<tr><td class="addr">6f3130c0</td><td>rand checksum 计算（179 字节）</td><td>S1、S11</td></tr>
+<tr><td class="addr">6f199400</td><td>查表 RNG（元组周期 8,965,109）</td><td>S11</td></tr>
+<tr><td class="addr">6f1ae7e0</td><td>RNG 播种（取模 61/59/53/47）</td><td>S11</td></tr>
+<tr><td class="addr">6f7f9070</td><td>JASS2 解释器主循环</td><td>S4</td></tr>
+<tr><td class="addr">6f1e9a50 / 6f6f5d00</td><td>JASS native 注册表 A / B（1167 次注册）</td><td>S3、S4、S6、S8、S9、S11</td></tr>
+<tr><td class="addr">6f6af530</td><td>单体伤害/治疗（虚函数 0x120/0x128）</td><td>S3</td></tr>
+<tr><td class="addr">6f6b19e0</td><td>AoE 伤害</td><td>S3</td></tr>
+<tr><td class="addr">6f661060</td><td>区域单位枚举（~130 调用者，推断，本体未反编译）</td><td>S3</td></tr>
+<tr><td class="addr">6f0e2f70</td><td>CGxDevice 双后端工厂（0=OpenGL，1=D3D）</td><td>S5</td></tr>
+<tr><td class="addr">6f0ec530</td><td>D3D9 动态加载（Direct3DCreate9 0x20）</td><td>S5</td></tr>
+<tr><td class="addr">6f0eb600</td><td>纹理上传</td><td>S5</td></tr>
+<tr><td class="addr">6f171ba0</td><td>音频播放分发器（流/序列/2D/3D）</td><td>S8</td></tr>
+<tr><td class="addr">6f171380</td><td>声音抢占（24 声上限）</td><td>S8</td></tr>
+<tr><td class="addr">6f2da7f0</td><td>录像加载器（版本校验 0x1b/0x17ab）</td><td>S9</td></tr>
+<tr><td class="addr">6f2b9d60 / 6f2b7560</td><td>Battle.net 登录屏（9 按钮）/ 主菜单（15 按钮）</td><td>S10</td></tr>
+</table>
+<div class="note"><strong>交叉验证结果（S12）：</strong>提取 S0–S11 全部文档中的 750 个不同 <code>FUN_6fxxxxxx</code> 地址，跨阶段共享地址逐一比对角色描述，<strong>无冲突</strong>；仅 <code>FUN_6f023e00</code> 等 3 处为多调用点观察、身份均未验证，记为待定。引擎通用常数 <code>0x7a2d</code> 在 S0 事件泵、S11 rand checksum 折叠中同源；<code>0x17ab</code> 同时出现在 S9 录像版本与 S11 校验折叠中，同值不同用途，不构成冲突。</div>
+
+<h2>0.3 仍未验证的残留点（归并 8 类，详见完整文档 §7）</h2>
+<ul>
+<li>三条“最后一跳”调用链（虚表分发）：引擎循环→帧步进、主循环→UI 更新、主循环→渲染提交、音频扫表调用方。</li>
+<li>模拟执行端：命令队列消费函数、各命令号语义、<code>FUN_6f661060</code> 本体、伤害阈值与三分类、技能施放主流程、移动/寻路。</li>
+<li>JASS2：两表分工与逐条映射、war3map.j 加载路径、TriggerSleepAction 与回合交互、字节码操作码。</li>
+<li>网络/同步数值：回合节奏、丢包重传、事件 0x22/0x23、七子系统哈希函数与打印函数、Storm 其余序号身份。</li>
+<li>渲染：能力标志位、BLP/MDX 加载、字体/视频/光照、帧率与 25 ms 步长解耦机制。</li>
+<li>UI：CFrame 虚表全表、按钮点击分发、.fdf 处理函数与 JASS 绑定、FrameDef 数字 ID 含义。</li>
+<li>文件/录像/Battle.net：写 MPQ 路径、录像格式与写入器、CONNSTATE 驱动与 BNCS 握手、网关域名、匹配算法。</li>
+<li>随机数：三状态用途映射、校验打印函数本体、CRandData RTTI、累加器完整周期。</li>
+</ul>
+
+<h2>1. 一句话结论</h2>
+<p>War3 用的是经典 <strong>确定性锁步（deterministic lockstep）</strong>：所有客户端<strong>不各自推进模拟</strong>，而是把本玩家的输入打包成“回合（Turn）”里的命令，经 <code>NetRouter</code> 发给所有对端；每一回合只有当<strong>所有玩家该回合的命令块（TurnsSyncChunk）都到齐</strong>，各端才用<strong>完全相同的输入 + 相同的随机种子</strong>推进同一回合的模拟。模拟结束后各子系统分别算校验和并交换比对，不一致就触发可信 desync 事件。</p>
+
+<h2>2. 总览：一个回合的旅程</h2>
+<div class="mermaid">
+flowchart LR
+  subgraph P1["玩家 A（本地）"]
+    A1["本地输入<br/>鼠标 / 键盘 / 指令"]
+    A2["CNetCommand*<br/>命令对象"]
+    A3["Net::ClientTurn<br/>本回合命令包"]
+  end
+  subgraph P2["玩家 B（对端）"]
+    B3["Net::ClientTurn<br/>本回合命令包"]
+  end
+  A1 --> A2 --> A3
+  A3 -->|"Net::ClientTurnsSync<br/>打包"| C1["Net::TurnsSyncChunk<br/>线上传输块"]
+  B3 --> C1
+  C1 -->|"NetRouter → Storm SNet"| C2["CTurnsSyncStore<br/>按回合组装"]
+  C2 -->|"回合 N 的块全部到齐"| D1["确定性模拟<br/>推进回合 N"]
+  D1 --> D2["各子系统校验和"]
+  D2 -->|"交换比对"| D3{"一致？"}
+  D3 -->|是| D4["进入回合 N+1"]
+  D3 -->|否| D5["CNetEventTrustedDesync<br/>EVENT_ID_TURNSSYNCMISMATCH"]
+</div>
+
+<h2>3. 核心机制拆解</h2>
+
+<h3>3.1 命令是网络对象：CNetCommand 族</h3>
+<p>玩家的一切操作（移动、攻击、施法、聊天 ping、方向键，甚至<strong>作弊码</strong>）都被做成 <code>CNetCommandBase</code> 的子类对象，随回合一起同步。RTTI 里可见的族系：</p>
+<table>
+<tr><th>类</th><th>含义</th></tr>
+<tr><td><code>CNetCommandBase</code></td><td>网络命令基类</td></tr>
+<tr><td><code>CNetCommandAllyPing</code> / <code>CNetCommandArrowKey</code></td><td>盟友 ping、方向键输入</td></tr>
+<tr><td><code>CNetCommandCheatBase</code> 及其 20+ 子类</td><td>作弊也是命令：God、Gold、Lumber、FastBuild、ShowMap、Victory/Defeat、TechTree……（所以作弊也要参与同步与校验，见 §3.4 的 cheat checksum）</td></tr>
+<tr><td><code>CAbility*Command</code>（如 <code>CAbilityAuraCommand</code>）</td><td>技能命令</td></tr>
+</table>
+<p>关键点：<strong>命令先同步、后执行</strong>。本地输入不会立刻生效，而是先进入本回合的 <code>ClientTurn</code>，等所有人到齐后才统一执行——这就是锁步消除“先看到先动手”的做法。</p>
+
+<h3>3.2 回合数据模型：TurnsSync 三件套</h3>
+<table>
+<tr><th>RTTI 类型</th><th>角色</th></tr>
+<tr><td><code>Net::ClientTurn</code></td><td>单个玩家一个回合的命令集合</td></tr>
+<tr><td><code>Net::ClientTurnsSync</code></td><td>单个玩家的回合同步状态（含回收器 <code>TInstanceRecycler&lt;ClientTurnsSync&gt;</code>）</td></tr>
+<tr><td><code>Net::TurnsSyncChunk</code></td><td>线上传输的回合数据块</td></tr>
+<tr><td><code>CTurnsSyncStore</code></td><td>收到的回合块仓库：按回合号组装，等齐了才放行模拟</td></tr>
+<tr><td><code>Net::NetRouter</code> / <code>Net::NetClient</code></td><td>路由与客户端：收发、主机交接（RouterHandoff）、延迟设置</td></tr>
+</table>
+<div class="mermaid">
+flowchart TB
+  CT["Net::ClientTurn<br/>本回合命令"] --> CTS["Net::ClientTurnsSync<br/>玩家回合同步状态"]
+  CTS --> TSC["Net::TurnsSyncChunk<br/>序列化上网"]
+  TSC --> NR["Net::NetRouter<br/>Storm SNet 传输"]
+  NR --> TSS["CTurnsSyncStore<br/>按回合号收齐各玩家块"]
+  TSS --> SIM["模拟推进一回合"]
+</div>
+
+<h3>3.3 事件泵：所有网络事件走同一条分发链</h3>
+<p>反编译确认了两条关键函数（地址见表）：</p>
+<div class="mermaid">
+flowchart TB
+  PUMP["FUN_6f30ade0 事件泵<br/>遍历网络事件链表"]
+  PUMP -->|"逐个事件：<br/>类型字节 +0x14，负载 +0x8，长度 +0xc"| PRE["FUN_6f307980 前处理"]
+  PRE --> H["FUN_6f3098d0 大分发器<br/>5074 字节，73 个被调函数"]
+  H --> POST["FUN_6f307880 后处理"]
+  H -->|"case 0x1e / 0x1f"| TS["FUN_6f310c80<br/>回合同步数据出入"]
+  H -->|"case 0x20"| TB["FUN_6f30b1a0"]
+  H -->|"case 0x22 / 0x23"| TA["FUN_6f3048c0 / FUN_6f304680<br/>应用回合 + 校验和步骤"]
+  H -->|"case 0x30 / 0x31<br/>仅游戏进行中"| TD["CNetEventTrustedDesync /<br/>CNetEventTrustedResult"]
+  H -->|"case 0x21"| LAT["CNetEventSetTurnsLatency<br/>回合延迟设置"]
+  H -->|"case 0x26–0x2a"| HO["CNetEventRouterHandoff*<br/>主机交接"]
+  H -->|"case 0x2b–0x2d"| DF["CNetEventDistFile*<br/>地图分发"]
+  PUMP -->|"类型 ≥ 0x40"| EXT["FUN_6f307b50 扩展事件"]
+</div>
+<p><code>FUN_6f3098d0</code> 是个按事件类型（<code>0x01</code>–<code>0x31</code>）的大 switch：Connect、Disconnect、GameList、GameCreate、GameJoin、PlayerJoin/Leave/Ready、GameSetup、GameStart、GameReady、Trigger……每个 case 生成对应的 <code>CNetEvent*</code> 对象交给上层。它还负责两件事：</p>
+<ul>
+<li><strong>录像</strong>：GameStart（<code>0x1b</code>）时写 <code>TempReplay.w3g</code>；每条网络命令还可写 <code>NET_COMMAND_SAVE</code> 记录——录像文件本质就是“回合命令流”的回放。</li>
+<li><strong>逐玩家状态表</strong>：以 <code>0x304</code> 为步长索引玩家槽（<code>+0x278</code> 字段为每玩家状态计数器），分发前先核对玩家状态。</li>
+</ul>
+
+<h3>3.4 校验和：七个子系统 + 雾 + 网络事件流</h3>
+<p>同步的“验算”分三层，全部在 DLL 里有字符串证据：</p>
+<table>
+<tr><th>层</th><th>证据</th><th>说明</th></tr>
+<tr><td>子系统校验和</td><td><code>%scheat / %scombat / %sgame / %snet / %srand / %stempest / %sunit checksum %08x</code></td><td>每回合对 cheat、战斗、游戏、网络、随机数、风暴（tempest）、单位七个子系统分别算校验和并打印；任何一个子系统的状态跑偏都会被定位到子系统级</td></tr>
+<tr><td>网络事件流校验和</td><td><code>syncNetEventChecksum = %08x</code>（<code class="addr">FUN_6f3079f0</code>）</td><td>事件泵在分发前对每条网络事件负载算滚动校验并累加到 <code>+0x227c</code> 累加器（见下），再经虚表取总值打印</td></tr>
+<tr><td>战争迷雾校验和</td><td><code>Last fog checksum was %d</code>（<code class="addr">FUN_6f231cd0</code>）</td><td>迷雾状态单独校验——迷雾是典型的“看似本地、实则必须同步”的状态</td></tr>
+</table>
+<div class="ev">
+<strong>网络事件校验和算法（已反编译，<code class="addr">FUN_6f30ade0</code> 内联）</strong>：对事件负载逐 dword 做 <code>acc = rotl(acc ^ word, 3)</code>，尾字节逐字节同样处理；再把结果按字节拆开，每字节乘 <code>0x7a2d</code> 异或后折叠进累加器。这是一个自定义滚动哈希，不是 CRC32——实现简单、速度快，够发现“某条事件流被改过/丢过”即可。
+</div>
+<div class="mermaid">
+flowchart LR
+  A["回合 N 模拟结束"] --> B["七子系统<br/>各算 checksum"]
+  B --> C["交换 checksum"]
+  C --> D{"全等？"}
+  D -->|是| E["继续"]
+  D -->|否| F["CNetEventTrustedDesync<br/>EVENT_ID_TURNSSYNCMISMATCH<br/>→ desync 处理"]
+</div>
+
+<h3>3.5 路由与锁步模式</h3>
+<ul>
+<li><code>FUN_6f283540</code> 引用字符串 <code>Router is running in lockstep mode</code>——路由器明确工作在锁步模式下。</li>
+<li><code>CNetEventSetTurnsLatency</code>（事件 <code>0x21</code>）：回合延迟是可调参数，用来吸收网络抖动——等一等、攒够了再推进，是锁步对抗延迟的标准做法。</li>
+<li><code>CNetEventRouterHandoff*</code>（<code>0x26</code>–<code>0x2a</code>）：主机交接事件，主机掉线时把路由职责移交，保证回合流不断。</li>
+<li><code>CNetEventDistFile*</code>（<code>0x2b</code>–<code>0x2d</code>）：地图文件分发，保证所有人用同一张图开局——同步的前提是同一份初始状态。</li>
+</ul>
+
+<h2>4. 关键函数地址表（Ghidra 反编译验证）</h2>
+<table>
+<tr><th>地址</th><th>函数</th><th>作用</th></tr>
+<tr><td class="addr">6f30ade0</td><td>FUN_6f30ade0</td><td>网络事件泵：遍历事件链表，算事件负载滚动校验，逐个分发</td></tr>
+<tr><td class="addr">6f3098d0</td><td>FUN_6f3098d0</td><td>网络事件大分发器（5074 字节）：按类型 0x01–0x31 生成 CNetEvent*，处理回合同步、录像、desync</td></tr>
+<tr><td class="addr">6f3079f0</td><td>FUN_6f3079f0</td><td>打印 syncNetEventChecksum（网络事件流校验和总值）</td></tr>
+<tr><td class="addr">6f231cd0</td><td>FUN_6f231cd0</td><td>打印战争迷雾校验和</td></tr>
+<tr><td class="addr">6f283540</td><td>FUN_6f283540</td><td>引用 "Router is running in lockstep mode"（路由器锁步模式）</td></tr>
+<tr><td class="addr">6f310c80</td><td>FUN_6f310c80</td><td>回合同步数据出入（事件 0x1e / 0x1f）</td></tr>
+<tr><td class="addr">6f3048c0 / 6f304680</td><td>—</td><td>应用回合 + 校验和步骤（事件 0x22 / 0x23）</td></tr>
+<tr><td class="addr">6f1206d0</td><td>Ordinal_548（Storm 导入）</td><td>日志输出口（checksum 打印都走它）</td></tr>
+</table>
+
+<h2>5. 确定性从哪里来（设计要点）</h2>
+<ul>
+<li><strong>同一输入</strong>：所有操作先变成命令、随回合同步，人人拿到同一份命令表。</li>
+<li><strong>同一随机数</strong>：随机数子系统单独校验（<code>rand checksum</code>）——随机数发生器是确定性种子序列，不是各机器自己掷骰子。</li>
+<li><strong>同一初始状态</strong>：地图分发（DistFile）+ 同一版本校验，保证开局状态一致。</li>
+<li><strong>同一节奏</strong>：回合是推进单位，不是墙钟时间；SetTurnsLatency 只调等待，不调模拟步长。</li>
+<li><strong>可验证</strong>：七子系统校验和 + 网络事件流校验和 + 迷雾校验和，三层交叉验证；一旦不一致就以 TrustedDesync 事件定性，而不是静默跑偏。</li>
+</ul>
+
+<div class="note"><strong>学习价值：</strong>这套设计对任何实时多人模拟都通用——“命令进回合、回合等人齐、模拟要确定、状态可校验、跑偏要定性”。实现时最关键的其实是最后一点：War3 不追求“绝不 desync”，而是追求“desync 一定能被发现、定位到子系统、并以事件形式上报”。</div>
+
+<div class="warn"><strong>未验证 / 待深挖：</strong>回合的 wall-clock 节奏（每秒几回合）未从本次反编译中确认；七子系统校验和的具体哈希函数与 <code>CTurnsSyncStore</code> 的“等齐”超时/丢包重传逻辑未展开；<code>FUN_6f3098d0</code> 的 <code>0x15</code>/<code>0x1b</code> 预处理分支只读了主干。以上可作为下一步定向深挖点。</div>
+
+<div class="note"><strong>合规说明：</strong>本分析仅用于学习引擎如何实现帧同步，不复制引擎代码与资产。Ghidra 工程在 <code>~/workspace/warcraf_ghidra/war3</code>，反编译原文在 <code>sync_decomp.txt</code>，函数与调用边在 <code>sync_dump2.txt</code>。</div>
+
+<footer>来源：Warcraf 仓库 Game.dll（Warcraft III 1.27.0.52240）· Ghidra 12.2 + JDK 25 分析 · S0 2026-11-05，S12 汇总更新 2026-11-06（S0–S12 全部已验证，计划完成）</footer>
+</body>
+</html>
