@@ -1,11 +1,19 @@
-# Warcraf -- Warcraft III 1.27a engine memory-layout description.
+# Warcraf -- Warcraft III 1.27a engine memory-layout description, plus a
+# clean-room reconstruction of the network layer (see README.md).
 #
 # NOTE: this project describes the memory layout of the 32-bit War3 1.27a
-# binaries (Game.dll / Storm.dll / Mss32.dll). It does NOT reimplement the
-# engine: the .cpp files are placeholder stubs that only include their
-# header (plus empty default-returning bodies for the seven Storm functions
-# Storm.h declares). The value of this project is the headers: verified
-# offsets, vtable layouts, and ordinal tables, each with its evidence.
+# binaries (Game.dll / Storm.dll / Mss32.dll). Most .cpp files are
+# placeholder stubs that only include their header (plus empty
+# default-returning bodies for the seven Storm functions Storm.h
+# declares). The value of the headers is the layout: verified offsets,
+# vtable layouts, and ordinal tables, each with its evidence.
+#
+# EXCEPTION: the network layer under src/warcraf/net/ (NetChecksum,
+# NetDataStore, NetCommandCodec, NetSession, NetEventPump, TurnsSync,
+# NetTransport) is REAL, runnable code -- a reconstruction of the original
+# behaviour from the Ghidra decompiles (net_decomp.txt / sync_decomp.txt)
+# and the S1 analysis. CBattleNet.cpp is still a stub: Battle.net is out
+# of scope for the reconstruction. See README.md for the evidence map.
 #
 # Layout asserts: the headers assert their pinned sizes/offsets at compile
 # time. Asserts involving pointers only fire on a 32-bit target (see
@@ -24,10 +32,18 @@ add_library(warcraf STATIC
   # math
   src/warcraf/math/Vector2.cpp
   src/warcraf/math/Vector3.cpp
-  # net
-  src/warcraf/net/CNetData.cpp
-  src/warcraf/net/NetRouter.cpp
-  src/warcraf/net/CNetCommand.cpp
+  # net -- real implementations (reconstruction from the decompiles).
+  # The layout headers CNetData.h / NetRouter.h / CNetCommand.h have no
+  # .cpp of their own anymore: their old placeholder stubs were replaced
+  # by the behavioural implementations below. CBattleNet.cpp is still a
+  # stub (Battle.net is out of scope for the reconstruction).
+  src/warcraf/net/NetChecksum.cpp
+  src/warcraf/net/NetDataStore.cpp
+  src/warcraf/net/NetCommandCodec.cpp
+  src/warcraf/net/NetSession.cpp
+  src/warcraf/net/NetEventPump.cpp
+  src/warcraf/net/TurnsSync.cpp
+  src/warcraf/net/NetTransport.cpp
   src/warcraf/net/CBattleNet.cpp
   # io
   src/warcraf/io/SFile.cpp
@@ -69,4 +85,15 @@ add_library(warcraf STATIC
 
 target_include_directories(warcraf PUBLIC include)
 target_compile_features(warcraf PUBLIC cxx_std_17)
+
+# Network-layer demo and unit tests (see README.md "Network layer").
+# The demo runs two loopback peers exchanging turns over real UDP
+# sockets on 127.0.0.1; the tests check the checksum, codec, lockstep
+# accounting, pump, turn-packet parse, and loopback transport.
+add_executable(warcraf_net_demo apps/net_demo/main.cpp)
+target_link_libraries(warcraf_net_demo PRIVATE warcraf)
+
+add_executable(warcraf_net_tests tests/net_tests.cpp)
+target_link_libraries(warcraf_net_tests PRIVATE warcraf)
+
 

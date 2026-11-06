@@ -1,10 +1,12 @@
-# Warcraf — Warcraft III 1.27a engine: header set
+# Warcraf — Warcraft III 1.27a engine: header set + network-layer reconstruction
 
 A C++ header description of the Warcraft III 1.27a (1.27.0.52240, build
 f7ba2a3, 2016-02-12) engine's memory layout: classes, vtables, network
 session state, Storm ordinals, JASS2 natives, renderer, UI, audio, replay,
-Battle.net, RNG. It describes the engine; it does **not** reimplement it.
-The real code lives in `Game.dll` / `Storm.dll` / `Mss32.dll` (see `dll/`).
+Battle.net, RNG. It describes the engine; it does **not** reimplement it —
+except for the network layer (see below), which is a runnable
+reconstruction from the Ghidra decompiles. The real code lives in
+`Game.dll` / `Storm.dll` / `Mss32.dll` (see `dll/`).
 
 Evidence: the S0–S12 analysis in `docs/` (frame sync, network, main loop,
 simulation, JASS2, render, UI, MPQ, audio, replay, Battle.net, RNG,
@@ -33,6 +35,13 @@ Warcraf/
             NetRouter.h     NetRouter / NetClient / OsNet
             CNetCommand.h   turn commands, CDataStore, WidgetDamageData
             CBattleNet.h    CONNSTATE, Battle.net events
+            NetChecksum.h   event checksum (FUN_6f30ade0) -- RECONSTRUCTION
+            NetDataStore.h  CDataStore buffer primitives -- RECONSTRUCTION
+            NetCommandCodec.h  CNetCommand wire codec -- RECONSTRUCTION
+            NetSession.h    runtime session state -- RECONSTRUCTION
+            NetEventPump.h  event pump + dispatchers -- RECONSTRUCTION
+            TurnsSync.h     lockstep core -- RECONSTRUCTION
+            NetTransport.h  router setup + UDP transport -- RECONSTRUCTION
     io/     SFile.h         Storm SFile/MPQ part (split out of Storm.h)
             CReplay.h       replay recording/playback, save-game classes
     engine/ CMainLoop.h     GameMain, engine loop, 25 ms step, EvtSched
@@ -51,8 +60,12 @@ Warcraf/
   src/warcraf/              one .cpp placeholder stub per header, mirroring
                             include/; only core/Storm.cpp has function bodies
                             (empty default-returning stubs for the 7 Storm
-                            functions Storm.h declares)
-  build/                    cmake build output (libwarcraf.a)
+                            functions Storm.h declares) -- EXCEPT net/:
+                            the seven Net*.cpp files are the real network
+                            reconstruction (CBattleNet.cpp is still a stub)
+  apps/net_demo/            warcraf_net_demo: two loopback peers, lockstep
+  tests/                    warcraf_net_tests: 96 unit checks
+  build/                    cmake build output (libwarcraf.a, demo, tests)
 ```
 
 ## Module -> analysis stage / evidence
@@ -67,6 +80,7 @@ Warcraf/
 | net/NetRouter.h | S1/S10 | S1 router setup; S10 OsNet RTTI |
 | net/CNetCommand.h | S2/S3/S9 | S3 command objects; S2 dispatch table; S9 class names |
 | net/CBattleNet.h | S10 | `warcraf_stage_battlenet.md` (CONNSTATE table, dispatcher) |
+| net/NetChecksum.h + NetDataStore.h + NetCommandCodec.h + NetSession.h + NetEventPump.h + TurnsSync.h + NetTransport.h | S1/S2/S3 | `net_decomp.txt` (FUN_6f310c80/6f30b1a0/6f2feb10/6f2fd0d0/6f307980/6f307880/6f283540/6f30e2b0) + `sync_decomp.txt` (FUN_6f30ade0) — see "Network layer reconstruction" below |
 | io/SFile.h | S1/S7 | S7 MPQ layout; S1 ordinal ranges; IDC ordinal names |
 | io/CReplay.h | S9 | `warcraf_stage_replay.md` |
 | engine/CMainLoop.h | S2 | `warcraf_stage_mainloop.md` |
@@ -81,13 +95,40 @@ Warcraf/
 
 ```sh
 cmake -B build -S .
-cmake --build build        # produces build/libwarcraf.a
+cmake --build build        # libwarcraf.a + warcraf_net_demo + warcraf_net_tests
 ```
 
 C++17, include dir `include/`, explicit source list in `CMakeLists.txt`
 (grouped by module). Verified 2026-11-06 on this host (g++ 13.3.0,
 cmake 3.28.3, 64-bit Linux): configure OK, build OK, `libwarcraf.a`
-40,152 bytes. Every header also passes `g++ -fsyntax-only` standalone.
+97,454 bytes (was 40,152 before the network reconstruction).
+Every header also passes `g++ -fsyntax-only` standalone.
+
+### Demo and tests (network layer)
+
+```sh
+./build/warcraf_net_tests            # 94 passed, 0 failed, 2 skipped (see below)
+./build/warcraf_net_demo --turns 20 # two loopback peers, 25 ms steps
+./build/warcraf_net_demo --turns 50 --step-ms 10   # longer run, faster step
+```
+
+Demo output (20 turns, 2026-11-06): every turn applied by both peers,
+`RESULT: OK -- 20 turns in lockstep, checksums consistent, no lost
+steps`. Per peer: `applied 20/20 turns | checksum mismatches 0 | lost
+steps 0 | bytes accumulated slot0=480 slot1=480 | bandwidth avg
+0x00000011 | global counter 20`. The two peers' session checksums
+differ (each folds its own received stream) — that is expected; the
+per-chunk checksums are what must match, and they do (0 mismatches).
+
+**Host note (UDP):** this sandbox rejects UDP `sendto` with EPERM
+(bind and TCP work; only datagram sends are blocked). The demo probes
+for that at startup and, when UDP is blocked, carries the identical
+datagram bytes over an in-process loopback channel instead — the
+checksum, pump, and lockstep logic are exercised exactly the same way,
+and the demo prints which channel it used. On an unrestricted host the
+real UDP path is used. The two UDP round-trip unit tests are likewise
+SKIPPED (not passed) on this host; the other 94 checks run and pass.
+`NetTransport` itself stays UDP in both cases.
 
 **32-bit caveat (read this):** the layout claims are 32-bit claims
 (pointers are 4 bytes). `WARCRAF_32BIT_LAYOUT` (in `core/Types.h`) is 1
@@ -100,6 +141,96 @@ to link, no 32-bit C runtime/headers, so the 32-bit asserts are
 untested here). The pointer-free asserts *did* fire on this host — and
 caught one real bug during this work (see correction list).
 
+## Network layer reconstruction (2026-11-06)
+
+Scope (user-confirmed): **basic network, frame sync, demo only** —
+Battle.net, replay, rendering, UI are untouched. The reconstruction is
+faithful to the decompiles: function division, constants, offsets,
+algorithms, and event flow follow `~/workspace/warcraf_ghidra/
+net_decomp.txt` + `sync_decomp.txt` and `warcraf_stage_network.md` (S1).
+Each implemented function cites its original address + evidence source
+in a comment. Nothing is pasted from the decompiles: the logic,
+constants, and flow are re-expressed in this project's own code.
+Names are meaningful (confirmed Blizzard names where confirmed, e.g.
+`getClassId`, `SMemFree`; otherwise behavior-descriptive names with
+evidence + confidence in comments). `FUN_6fxxxxxx` / `funcN` are never
+used as implementation names.
+
+### What is implemented (evidence per part)
+
+| Part | Original function(s) | Evidence |
+|---|---|---|
+| Event checksum: payload roll `rotl(acc ^ word, 3)`, 0x7a2d fold, session accumulator +0x227c | FUN_6f30ade0 | `sync_decomp.txt` lines ~830–910; S1 §3.2/§6 |
+| DataStore buffer: write dword/byte, sequential reads, read-three, 1460-byte cache | FUN_6f04e1d0 / 6f04dfa0 / 6f83f8e0 / 6f04d3b0 | CNetCommand.h (S3); `net_decomp.txt` FUN_6f2feb10 (CDataStoreCache<1460>) |
+| Command codec: 0x1a/0x1b/0x1c (1 dword), 0x17 (dword+byte+2 dwords), 0x16 (byte+dword, partial) | FUN_6f83ee60 / 6f83f010 / 6f83efd0 / 6f83f090 / 6f83f060 | CNetCommand.h reader table; S3 |
+| Session state: mode tag +0x2288, local slot +0x610, frame state +0x278, checksum +0x227c, budget +0x225c, bandwidth +0x2258, counter +0x1c68, record state +0xbe4, per-player +0x284/+0x2e0 | — (fields) | CNetData.h; S1 |
+| Game magic "WAR3"/"W3XP" | FUN_6f30e2b0 | `net_decomp.txt` |
+| Event pump: outer gate (+0x173c/+0x1744), checksum gate, 0x17/0x21/0x2f handling, pre/post dispatch, 0x1e/0x1f break, param_2==0 break, BN stub for ≥0x40 | FUN_6f30ade0 / 6f307980 / 6f307880 / 6f3098d0 / 6f307b50 | `sync_decomp.txt`; `net_decomp.txt` |
+| TurnsSync accounting: slot-0 counter, +0x284 accum, +0x225c budget, (old*7+bytes)>>3 average, countdown max−bytes, advance + local actions | FUN_6f310c80 | `net_decomp.txt`; S1 §4 |
+| Turn store: submit / complete-when-all-in / take in slot order | CTurnsSyncStore (RTTI) | S0 |
+| Turn-packet parse skeleton: 3-byte header, count, type-byte dispatch 0x10–0x14/0x20 | FUN_6f30b1a0 | `net_decomp.txt`; S1 |
+| Per-turn log line `War3Net: (INFO): turn %u: %s from %u` | FUN_6f2fd0d0 | `net_decomp.txt` |
+| Router setup: flag rules (0x10/0x400000→param6=0xc; 0x200 reuse; 0x80000000), SStrCopy bounds (name 0x20, password 0x10, map/path 0x36) | FUN_6f283540 | `net_decomp.txt`; S1 §5 |
+| Event send entry (type + store) | FUN_6f2feb10 | `net_decomp.txt` |
+| UDP transport (POSIX sockets; Winsock on Windows, untested here) | WS2_32 + internal Net functions | S1 §2 (SNet is NOT in Storm's import table) |
+
+Two corrections the decompiles forced during this work (the S1 text was
+less precise): **0x1e shares the 0x1f checksum block** (both set
+`local_38`, so both stop the pump after dispatch — S1 mentions 0x1f
+only), and **param_2 == 0 breaks before the fold and before dispatch**
+(the event stays queued; it is not "dispatched then stopped"). The
+implementation follows the decompile in both cases; the headers note
+the discrepancy.
+
+### What is still stub / unverified in the network layer
+
+- **Battle.net**: the pump counts ≥0x40 events in a stub only
+  (FUN_6f307b50 not implemented; no handshake). Out of scope.
+- **Wire envelope**: the datagram carries exactly the CDataStore
+  bytes; no envelope is added. The event type that FUN_6f2feb10
+  passes to FUN_6f311750 is not placed on the wire — FUN_6f311750's
+  internals are not in the decompiles, so its wire effect is an
+  evidence gap. The demo's receiving side is told the event type by
+  the harness (0x1f), not by the wire.
+- **Turn-chunk framing** (`[u32 length][commands][0x1f]`): a
+  reconstruction from the 0x1e/0x1f batch-path description (a length
+  is read first, 0x1f sets the end flag) — marked as such in
+  `NetCommandCodec.h`, not claimed as the original's.
+- **Command layouts**: only 0x1a/0x1b/0x1c/0x17/0x16 are evidenced.
+  0x23's list layout cannot be reconstructed (its count lives at a
+  reader-frame offset, not a wire offset); every other command number
+  has no evidenced reader. The codec refuses those instead of
+  inventing a layout. Command-number semantics (move/attack/cast) are
+  UNVERIFIED everywhere.
+- **Turn-packet sub-record payloads**: the six constructors
+  (FUN_6f2fc4b0/6f2fc7d0/6f2fc590/6f2fc710/6f2fc650/6f2fc3d0) are
+  naming gaps; the parser reports them and stops unless the caller
+  states the payload size (the demo's bare type-byte packets do).
+- **Byte count source** FUN_6f3086a0, **transmit** FUN_6f311750,
+  **store fill** FUN_6f83f350, **countdown-zero** FUN_6f30b460,
+  **advance** FUN_6f3130c0, **local actions** FUN_6f3023c0/6f304920/
+  6f840bd0/6f3041c0, **retain** FUN_6f312dc0, **post-dispatch**
+  FUN_6f3039f0, **delivery** FUN_6f30ada0, **preprocess**
+  FUN_6f02d2d0, **0x21/0x2f follow-ups** FUN_6f83e540/6f83e670,
+  **0x17 store path** FUN_6f0fb2c0, **router internals**
+  FUN_6f1c0680/6f1cccc0/6f1bb730/6f76e060/6f0210a0/6f287160/6f2821f0/
+  6f842600/6f18cb00: addresses known, identities/behaviour
+  unidentified — they appear as named callbacks/hooks, never as
+  invented implementations.
+- **Player-table size**: the per-player stride (0x304) is evidenced;
+  how many entries the table has is not — the session takes the
+  player count as a parameter (the demo uses 2).
+- **DataStore growth factor**: the original grows via its vtable
+  (+0x0c) through SMemAlloc/ReAlloc; the factor is not evidenced —
+  this implementation doubles (marked as reconstruction).
+- **0x1e out / 0x1f in direction**: S1 lists them together without a
+  direction; the demo's assignment is an interpretation (both go
+  through the same checksum/accounting path).
+- **UDP vs stream**: the original's turn path is carried here over
+  UDP datagrams (per the task brief); whether the original used
+  datagrams or a stream for turns is not evidenced (OsNet RTTI
+  includes TCPLISTEN).
+
 ## What is verified / stub / unverified
 
 - **Verified:** all offsets/sizes/addresses named in the headers, each
@@ -107,10 +238,16 @@ caught one real bug during this work (see correction list).
   compile time (pointer-free ones on any host, all of them on a 32-bit
   target). Vtable slot counts and per-slot function addresses come from
   the Ghidra dump; renamed slots carry their evidence in the comment.
+  The network reconstruction is verified by `warcraf_net_tests`
+  (94 checks; checksum vectors cross-checked against an independent
+  Python transcription of FUN_6f30ade0) and by `warcraf_net_demo`
+  (20 and 50 turns, lockstep, 0 checksum mismatches, 0 lost steps).
 - **Stub:** every `.cpp` under `src/` is a placeholder (`占位桩，仅用于占位与
-  编译通过，不含引擎实现`). The 7 Storm functions get empty bodies returning
-  defaults; everything else is include-only. No engine behaviour is
-  implemented here.
+  编译通过，不含引擎实现`) — **except** the seven `src/warcraf/net/
+  Net*.cpp` files, which are the real network reconstruction, and
+  `core/Storm.cpp` (empty bodies for the 7 Storm functions).
+  `CBattleNet.cpp` is still a stub (Battle.net out of scope).
+  No engine behaviour is implemented here beyond the network layer.
 - **Unverified:** every `field_XX` / `funcN` / `UNVERIFIED` marker in the
   headers, plus the per-header notes. Largest gaps: most vtable slot
   identities (only 3–11 slots per vtable are named, the rest are funcN);
@@ -118,7 +255,8 @@ caught one real bug during this work (see correction list).
   command-queue drain function; the Battle.net handshake packet format;
   the `.w3g` file format; the three RNG states' individual purposes;
   the S1 unmapped Storm ordinals (151, 428, 471, 524, 525, 534, 537, 568,
-  589, 595, 596, 597) and unknown-semantics SErr470 / SMem496 / SLog543.
+  589, 595, 596, 597) and unknown-semantics SErr470 / SMem496 / SLog543;
+  the network-layer gaps listed in the section above.
 
 ## Correction list (TinkerWorX originals -> this project)
 
@@ -220,6 +358,9 @@ In `~/workspace/warcraf_tools/` (outside this repo):
   `math/` with the attribution, guards, include retargeting, and
   `static_assert`s.
 - `gen_stubs.py` — generates the 38 `src/` stubs and `CMakeLists.txt`.
+  Do NOT re-run it over `src/warcraf/net/`: the CNetData / NetRouter /
+  CNetCommand stubs were replaced by hand-written implementations
+  (NetSession / NetTransport / NetCommandCodec etc.) in 2026-11-06.
 
 ## What is still unverified (short list)
 
