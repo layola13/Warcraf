@@ -44,11 +44,53 @@ Storm.dll  传输与系统层（SNet 序号导出 / SFile MPQ / 同步原语 / �
 | 569–572、574–581、584、589–590、595–597 | 0x1503a5e0–0x1503af00 | 字符串簇（569 与 571 同地址 0x1503a5e0，570 与 572 同地址 0x1503a610——同一函数的两个序号入口） |
 | 601–638 | 0x1500df20–0x1500e630 | 约 0x60 间隔的一串小函数（疑似小包装器/跳转表） |
 
-已验证身份的三个序号（按调用点反编译确认，其余序号的函数身份**未验证**）：
+已验证身份的三个序号（按调用点反编译确认，并与 TinkerWorX 的 `Map Storm Imports.idc` 交叉核对一致）：
 
-- **548**：printf 风格日志输出口。调用形如 `Ordinal_548(fmt, ...)`，所有 checksum 打印（`syncNetEventChecksum = %08x`、`Last fog checksum`、`Net:\n`）都走它。
-- **501**：有界字符串拷贝。调用形如 `Ordinal_501(dst, src, 0x20/0x10/0x36)`，路由器建立函数用它拷贝名字、密码等字段。
-- **403**：条件日志/事件上报。`FUN_6f304680` 中 `if (*(p+0x70)) Ordinal_403(v, "%E…"串, -2, 0)`。
+- **548 = SLogWrite**：printf 风格日志输出口。调用形如 `Ordinal_548(fmt, ...)`，所有 checksum 打印（`syncNetEventChecksum = %08x`、`Last fog checksum`、`Net:\n`）都走它。
+- **501 = SStrCopy**：`int __stdcall SStrCopy(char* destination, char* source, int maxLength)`。调用形如 `Ordinal_501(dst, src, 0x20/0x10/0x36)`，路由器建立函数用它拷贝名字、密码等字段。
+- **403 = SMemFree**（**更正**：此前版本误写为“条件日志/事件上报”）：`BOOL __stdcall SMemFree(void* handle, const char* fileName, int fileLine, int defaultValue)`。`FUN_6f304680` 的调用 `Ordinal_403(*(p+0x70), 文件名字符串, -2, 0)` 是带调试标记（文件名 + 行号）的条件释放——字段非空时释放该句柄，不是日志调用。
+
+其余序号的函数名来自 TinkerWorX `Map Storm Imports.idc`（第三方逆向标注，未逐个核对调用点，仅 501/548/403 有调用点交叉验证）：
+
+| 序号 | 名字 | 序号 | 名字 |
+|---|---|---|---|
+| 251 | SFileAuthenticateArchive | 252 | SFileCloseArchive |
+| 253 | SFileCloseFile | 263 | SFileEnableDirectAccess |
+| 264 | SFileGetFileArchive | 265 | SFileGetFileSize |
+| 266 | SFileOpenArchive | 267 | SFileOpenFile |
+| 268 | SFileOpenFileEx | 269 | SFileReadFile |
+| 270 | SFileSetBasePath | 271 | SFileSetFilePointer |
+| 272 | SFileSetLocale | 275 | SFileGetArchiveName |
+| 279 | SFileLoadFile | 280 | SFileUnloadFile |
+| 281 | SFileLoadFileEx | 288 | SFileFileExists |
+| 289 | SFileFileExistsEx | 293 | SFileOpenFileAsArchive |
+| 294 | SFileGetLocale | 295 | SFileRegisterLoadNotifyProc |
+| 300 | SFileOpenPathAsArchive | 302 | StormGetInstance |
+| 401 | SMemAlloc | 405 | SMemReAlloc |
+| 421–426 | SRegLoadData / LoadString / LoadValue / SaveData / SaveString / SaveValue | 460 | SErrInit |
+| 461 | SErrDisplayError | 462 | SErrGetErrorStr |
+| 463 | SErrGetLastError | 465 | SErrSetLastError |
+| 469 | SErrRegisterHandler | 470 | SErr470（语义未知） |
+| 472 | SCmdGetBool | 474 | SCmdGetString |
+| 476 | SCmdRegisterArgList | 479 | SCmdProcessCommandLine |
+| 482 | SMemFindNextHeap | 496 | SMem496（语义未知） |
+| 502 | SStrHash1 | 503 | SStrNCat |
+| 504 | SStrTokenize | 506 | SStrLen |
+| 507 | SStrDup | 508 | SStrCmp |
+| 509 | SStrCmpI | 510 | SStrUpper |
+| 541 | SLogClose | 542 | SLogCreate |
+| 543 | SLog543（语义未知） | 544 | SLogDump |
+| 545 | SLogFlush | 551 | SCompCompress |
+| 552 | SCompDecompress | 553 | SLogVWrite |
+| 563 | SErrIsDisplayingError | 565 | SErrSetLogTitleString |
+| 567 | SErrCatchUnhandledExceptions | 569–572 | SStrChr1 / ChrR1 / Chr2 / ChrR2 |
+| 574 | SStrToFloat | 575 | SStrToInt |
+| 576 | SStrToUnsigned | 577 | SStrToInt64 |
+| 578 | SStrVPrintf | 579 | SStrLower |
+| 581 | SStrPrintf | 584–587 | SStrStrI1 / StrI2 / Str1 / Str2 |
+| 590 | SStrHash2 | 601–638 | SBigAdd / Compare / Del / Div / FromBinary / FromUnsigned / IsPrime / Mod / Mul / New / PowMod / Shl / Sub / ToBinaryBuffer |
+
+注：251–302 段全是 `SFile*`（MPQ 文件层），并非 SNet——SNet 的收发/建连并不经过 Game.dll 的 Storm 导入表（S1 原文“疑似 SNet”的推测不成立；网络收发实际走 WS2_32 Winsock 导入与 Net 层内部函数）。
 
 其它导入：`WS2_32.dll` 26 个（按序号，Winsock）；`WINMM.dll` 仅 `timeGetTime` 一个——回合定时很可能以它为时钟（推断，未验证）；`mss32.dll` 110 个 `AIL_*`（音频，S8）；`OPENGL32.dll` 50 个（渲染，S5）。
 
@@ -168,14 +210,14 @@ Storm.dll  传输与系统层（SNet 序号导出 / SFile MPQ / 同步原语 / �
 | 6f3128d0 / 6f312930 | — | CNetData::SetRecordState / SetReplayState 状态机 |
 | 6f283540 | FUN_6f283540 | 路由器建立（锁步模式） |
 | 6f3079f0 / 6f231cd0 | — | syncNetEventChecksum / 迷雾校验和打印（回调表调用） |
-| 6f3048c0 / 6f304680 | — | 13 字节转发桩 / Storm 403 条件日志 |
-| 1502a330 | Storm ord 548 | printf 风格日志口 |
-| 1503a6c0 | Storm ord 501 | 有界字符串拷贝 |
-| 1502be40 | Storm ord 403 | 条件日志/事件上报 |
+| 6f3048c0 / 6f304680 | — | 13 字节转发桩 / 条件释放（SMemFree，释 +0x70 句柄） |
+| 1502a330 | Storm ord 548 | SLogWrite（printf 风格日志口） |
+| 1503a6c0 | Storm ord 501 | SStrCopy（有界字符串拷贝） |
+| 1502be40 | Storm ord 403 | SMemFree（带调试标记的释放） |
 
 ## 8. 未验证点（留给后续轮次或专项）
 
-1. 112 个 Storm 序号导入里，除 548/501/403 外的函数身份（需逐个反编译 Storm 对应地址；重点是 251–253、263–272、401–428、460–482、524–553 段，疑似 SNet 收发/建连/枚举）。
+1. 仍无名字的 Storm 序号导入：151、428、471、524、525、534、537、568、589、595、596、597（TinkerWorX 的 IDC 里未标注）；以及只有名字、语义未知的 SErr470、SMem496、SLog543。251–302 段已确认为 SFile（非 SNet），SNet 收发身份问题已关闭。
 2. 七子系统校验和各自的哈希函数（回调表里的实现）。
 3. 回合节奏数值（每秒几回合）与 `SetTurnsLatency` 的具体换算；泵驱动点 `FUN_6f30ff00` / `FUN_6f310f20` 的调用链与 `timeGetTime` 的关系。
 4. 丢包重传与“等齐”超时逻辑（`FUN_6f30b460` 与 `+0x2e0` 倒计时的完整语义）。
